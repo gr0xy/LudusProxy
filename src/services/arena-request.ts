@@ -79,8 +79,8 @@ export async function directRequestWithRetry(
       break;
     } else if (status === 429) {
       if (attempt < maxRetries - 1) {
-        debug(`Rate limited (429), waiting 2s before retry...`);
-        await new Promise((r) => setTimeout(r, 2000));
+        debug(`Rate limited (429), waiting 5s before retry...`);
+        await new Promise((r) => setTimeout(r, 5000));
         continue;
       }
       debug(`HTTP 429: retry limit reached`);

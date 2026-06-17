@@ -127,34 +127,49 @@ async function resolveTurnstile(page: Page): Promise<void> {
 
 let _mintPage: Page | null = null;
 
+/**
+ * Ensure we have a live mint page on arena.ai.
+ * On first call: creates page, navigates, resolves Turnstile, injects scripts.
+ * On subsequent calls: reloads the page to clear DOM/JS state while keeping
+ * context cookies (cf_clearance), so Turnstile auto-resolves.
+ */
 async function getMintPage(): Promise<Page> {
-  // Reuse existing page if still alive
-  if (_mintPage && !_mintPage.isClosed()) return _mintPage;
-
   const cfg = getConfig();
-  const context = await getContext();
 
-  if (cfg.cf_clearance) {
-    await context.addCookies([{
-      name: "cf_clearance",
-      value: cfg.cf_clearance,
-      domain: ".arena.ai",
-      path: "/",
-    }]);
+  // First time — create page and do full setup
+  if (!_mintPage || _mintPage.isClosed()) {
+    const context = await getContext();
+
+    if (cfg.cf_clearance) {
+      await context.addCookies([{
+        name: "cf_clearance",
+        value: cfg.cf_clearance,
+        domain: ".arena.ai",
+        path: "/",
+      }]);
+    }
+
+    _mintPage = await context.newPage();
+    await _mintPage.goto(`${ARENA_BASE_URL}/?mode=direct`, {
+      waitUntil: "domcontentloaded",
+      timeout: STARTUP_NAV_TIMEOUT_MS,
+    });
+    await resolveTurnstile(_mintPage);
+    debug("Mint page created on arena.ai");
+  } else {
+    // Reload to clear stale DOM/JS state — Turnstile won't re-appear
+    // because cf_clearance cookie is in the context.
+    await _mintPage.reload({ waitUntil: "domcontentloaded", timeout: STARTUP_NAV_TIMEOUT_MS });
+    debug("Mint page reloaded");
   }
 
-  _mintPage = await context.newPage();
-  await _mintPage.goto(`${ARENA_BASE_URL}/?mode=direct`, {
-    waitUntil: "domcontentloaded",
-    timeout: STARTUP_NAV_TIMEOUT_MS,
-  });
-  await resolveTurnstile(_mintPage);
-
-  // Wait for reCAPTCHA library to be ready
+  // Wait for reCAPTCHA library
   await _mintPage.waitForTimeout(2000);
+
   const hasGrecaptcha = await _mintPage.evaluate(`
     !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))
   `);
+
   if (!hasGrecaptcha) {
     const sitekey = (cfg.recaptcha_sitekey as string) || RECAPTCHA_SITEKEY;
     debug("Injecting reCAPTCHA scripts...");
@@ -177,7 +192,6 @@ async function getMintPage(): Promise<Page> {
     await _mintPage.waitForTimeout(5000);
   }
 
-  debug("Mint page ready on arena.ai");
   return _mintPage;
 }
 
@@ -217,12 +231,14 @@ export async function mintRecaptchaToken(): Promise<string | null> {
       return token;
     }
 
-    // Page might be stale — destroy and retry once
+    // Page might be stale — destroy and recreate on next call
     debug("reCAPTCHA returned null, resetting mint page...");
+    try { await _mintPage?.close(); } catch {}
     _mintPage = null;
     return null;
   } catch (e) {
     error("reCAPTCHA minting failed:", e);
+    try { await _mintPage?.close(); } catch {}
     _mintPage = null;
     return null;
   }
