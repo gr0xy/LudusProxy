@@ -92,6 +92,21 @@ export async function getContext(): Promise<BrowserContext> {
   return _context;
 }
 
+/**
+ * Extract all cookies for arena.ai from the browser context.
+ * Used to inject into direct HTTP requests so they have the same
+ * cookie state as the browser.
+ */
+export async function getArenaCookies(): Promise<string> {
+  if (!_context) return "";
+  try {
+    const cookies = await _context.cookies(ARENA_BASE_URL);
+    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return "";
+  }
+}
+
 export async function closeBrowser(): Promise<void> {
   try { await _mintPage?.close(); } catch {}
   _mintPage = null;
@@ -155,12 +170,37 @@ async function getMintPage(): Promise<Page> {
       timeout: STARTUP_NAV_TIMEOUT_MS,
     });
     await resolveTurnstile(_mintPage);
+
+    // Warm-up: wait for page to settle and age the fingerprint.
+    // reCAPTCHA v3 scores improve when the page has been alive longer
+    // and has some DOM activity. Without this, the first mint gets rejected.
+    await _mintPage.waitForTimeout(3000);
+    // Simulate genuine user activity — scroll, mouse movement
+    await _mintPage.mouse.move(640, 360);
+    await _mintPage.waitForTimeout(500);
+    await _mintPage.mouse.move(400, 200);
+    await _mintPage.waitForTimeout(500);
+    await _mintPage.evaluate(() => window.scrollBy(0, 200));
+    await _mintPage.waitForTimeout(1500);
+    await _mintPage.evaluate(() => window.scrollBy(0, -100));
+    await _mintPage.waitForTimeout(1500);
+    await _mintPage.mouse.move(300, 150);
+    await _mintPage.waitForTimeout(1000);
+
     debug("Mint page created on arena.ai");
   } else {
-    // Reload to clear stale DOM/JS state — Turnstile won't re-appear
-    // because cf_clearance cookie is in the context.
-    await _mintPage.reload({ waitUntil: "domcontentloaded", timeout: STARTUP_NAV_TIMEOUT_MS });
-    debug("Mint page reloaded");
+    // Navigate to a neutral page first to reset reCAPTCHA scoring context,
+    // then back to arena.ai. This prevents the reCAPTCHA server from seeing
+    // rapid repeated token requests from the same page context.
+    await _mintPage.goto("about:blank", { timeout: 5000 });
+    await _mintPage.waitForTimeout(1000);
+    await _mintPage.goto(`${ARENA_BASE_URL}/?mode=direct`, {
+      waitUntil: "domcontentloaded",
+      timeout: STARTUP_NAV_TIMEOUT_MS,
+    });
+    // Turnstile won't re-appear because cf_clearance cookie is in context
+    await resolveTurnstile(_mintPage);
+    debug("Mint page refreshed (neutral navigate)");
   }
 
   // Wait for reCAPTCHA library

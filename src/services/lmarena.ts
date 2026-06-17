@@ -190,7 +190,7 @@ export async function directRequest(
   method: string,
   body: string,
   headers: Record<string, string>
-): Promise<{ status: number; text: string }> {
+): Promise<{ status: number; text: string; headers: Record<string, string> }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
@@ -201,7 +201,9 @@ export async function directRequest(
       signal: controller.signal,
     });
     const text = await res.text();
-    return { status: res.status, text };
+    const resHeaders: Record<string, string> = {};
+    res.headers.forEach((v, k) => { resHeaders[k] = v; });
+    return { status: res.status, text, headers: resHeaders };
   } finally {
     clearTimeout(timer);
   }
