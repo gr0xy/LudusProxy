@@ -51,13 +51,13 @@ export async function getBrowser(): Promise<Browser> {
     debug("Launching Camoufox (patched Firefox)");
     _browser = await firefox.launch({
       executablePath: camoufoxPath,
-      headless: false,
+      headless: true,
       args: ["--no-remote"],
     });
   } else {
     debug("Launching Playwright Firefox (no Camoufox found)");
     _browser = await firefox.launch({
-      headless: false,
+      headless: true,
       firefoxUserPrefs: {
         "dom.webdriver.enabled": false,
         "useAutomationExtension": false,
@@ -93,6 +93,8 @@ export async function getContext(): Promise<BrowserContext> {
 }
 
 export async function closeBrowser(): Promise<void> {
+  try { await _mintPage?.close(); } catch {}
+  _mintPage = null;
   try { await _context?.close(); } catch {}
   try { await _browser?.close(); } catch {}
   _context = null;
@@ -123,61 +125,74 @@ async function resolveTurnstile(page: Page): Promise<void> {
 
 // ---------- reCAPTCHA minting ----------
 
+let _mintPage: Page | null = null;
+
+async function getMintPage(): Promise<Page> {
+  // Reuse existing page if still alive
+  if (_mintPage && !_mintPage.isClosed()) return _mintPage;
+
+  const cfg = getConfig();
+  const context = await getContext();
+
+  if (cfg.cf_clearance) {
+    await context.addCookies([{
+      name: "cf_clearance",
+      value: cfg.cf_clearance,
+      domain: ".arena.ai",
+      path: "/",
+    }]);
+  }
+
+  _mintPage = await context.newPage();
+  await _mintPage.goto(`${ARENA_BASE_URL}/?mode=direct`, {
+    waitUntil: "domcontentloaded",
+    timeout: STARTUP_NAV_TIMEOUT_MS,
+  });
+  await resolveTurnstile(_mintPage);
+
+  // Wait for reCAPTCHA library to be ready
+  await _mintPage.waitForTimeout(2000);
+  const hasGrecaptcha = await _mintPage.evaluate(`
+    !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))
+  `);
+  if (!hasGrecaptcha) {
+    const sitekey = (cfg.recaptcha_sitekey as string) || RECAPTCHA_SITEKEY;
+    debug("Injecting reCAPTCHA scripts...");
+    await _mintPage.evaluate((key: string) => {
+      if ((window as any).__LM_RECAPTCHA_INJECTED) return;
+      (window as any).__LM_RECAPTCHA_INJECTED = true;
+      const h = document.head;
+      if (!h) return;
+      for (const src of [
+        "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(key),
+        "https://www.google.com/recaptcha/api.js?render=" + encodeURIComponent(key),
+      ]) {
+        const s = document.createElement("script");
+        s.src = src;
+        s.async = true;
+        s.defer = true;
+        h.appendChild(s);
+      }
+    }, sitekey);
+    await _mintPage.waitForTimeout(5000);
+  }
+
+  debug("Mint page ready on arena.ai");
+  return _mintPage;
+}
+
 export async function mintRecaptchaToken(): Promise<string | null> {
   if (isRecaptchaValid()) return RECAPTCHA_TOKEN;
 
   clearRecaptchaToken();
-  debug("Minting reCAPTCHA v3 token via browser...");
+  debug("Minting reCAPTCHA v3 token...");
 
   const cfg = getConfig();
   const sitekey = (cfg.recaptcha_sitekey as string) || RECAPTCHA_SITEKEY;
   const action = (cfg.recaptcha_action as string) || RECAPTCHA_ACTION;
 
   try {
-    const context = await getContext();
-    const page = await context.newPage();
-
-    if (cfg.cf_clearance) {
-      await context.addCookies([{
-        name: "cf_clearance",
-        value: cfg.cf_clearance,
-        domain: ".arena.ai",
-        path: "/",
-      }]);
-    }
-
-    await page.goto(`${ARENA_BASE_URL}/?mode=direct`, {
-      waitUntil: "domcontentloaded",
-      timeout: STARTUP_NAV_TIMEOUT_MS,
-    });
-
-    await resolveTurnstile(page);
-    await page.waitForTimeout(2000);
-
-    const hasGrecaptcha = await page.evaluate(`
-      !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))
-    `);
-
-    if (!hasGrecaptcha) {
-      debug("Injecting reCAPTCHA scripts...");
-      await page.evaluate((key: string) => {
-        if ((window as any).__LM_RECAPTCHA_INJECTED) return;
-        (window as any).__LM_RECAPTCHA_INJECTED = true;
-        const h = document.head;
-        if (!h) return;
-        for (const src of [
-          "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(key),
-          "https://www.google.com/recaptcha/api.js?render=" + encodeURIComponent(key),
-        ]) {
-          const s = document.createElement("script");
-          s.src = src;
-          s.async = true;
-          s.defer = true;
-          h.appendChild(s);
-        }
-      }, sitekey);
-      await page.waitForTimeout(5000);
-    }
+    const page = await getMintPage();
 
     const token = (await page.evaluate(`
       (async function() {
@@ -196,18 +211,19 @@ export async function mintRecaptchaToken(): Promise<string | null> {
       })()
     `)) as string | null;
 
-    await page.close();
-
     if (token) {
       setRecaptchaToken(token, action, RECAPTCHA_TOKEN_TTL_MS);
       debug(`reCAPTCHA token minted (${token.length} chars)`);
       return token;
     }
 
-    error("reCAPTCHA minting returned null");
+    // Page might be stale — destroy and retry once
+    debug("reCAPTCHA returned null, resetting mint page...");
+    _mintPage = null;
     return null;
   } catch (e) {
     error("reCAPTCHA minting failed:", e);
+    _mintPage = null;
     return null;
   }
 }
